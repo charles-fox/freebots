@@ -1,0 +1,495 @@
+#!/usr/bin/env python
+
+#Freebots
+#
+#So=scene object, Sb=scene basic (vectors etc)
+#
+#           |
+#           |
+#           |sin th
+#  ---------+--------> x
+#           |\
+#     cos th| \ 
+#           |th\
+#           |--->
+#           v
+#           z
+#
+#         initial view from this side
+
+# NB need to run with v short dt to model high freq vibrations!
+# (eg in slowmotion, then speed up the saved video afterwards)
+
+import sys
+import ode
+from pivy.sogui import *
+from pivy.coin import *
+from OpenGL.GL import *    #needed only for additional drawings
+from cf import *
+from robot_sg import *
+from rat_sg import *
+from SimpleController import *
+from IceaController import *
+
+SEG_LENGTH=0.25
+
+floorObj = []
+
+class Universe:
+    def __init__(self):
+
+        #CACHES
+        self.physicals = []  #static and moving - for collision tests
+        self.movings = [] #moving only
+        self.robots=[] #things with controllers
+        self.rawGLObjects = []  #things that need to call special graphics
+
+        #ODE
+        self.world = ode.World()        
+        self.world.setGravity((0,0,0)) #(0,-9.81,0)
+        self.space = ode.Space()  #for environment object geoms
+        self.segSpace = ode.Space()  #keep segs in sep space to reduce number of comparisons
+        self.robotSpace = ode.Space() #for the robot body parts
+        self.contactgroup = ode.JointGroup()
+
+        #INVENTOR
+        root = SoSeparator()#collide((u.world, u.contactgroup), contact_callback) #TODO replacewith custom collisions, segs vs whole world and robot vs whole world
+
+        root.addChild(SoDirectionalLight())
+        self.myCamera = SoPerspectiveCamera()
+        root.addChild(self.myCamera)    
+        myMaterial = SoMaterial()
+        myMaterial.diffuseColor = (1.0, 0.0, 0.0)   # Red
+        root.addChild(myMaterial)
+        env=SoSeparator() #the environent (ie not robots)
+        root.addChild(env)
+
+        ground=SoSeparator()
+        tr = SoTransform()
+        tr.translation.setValue(0.0,0.0,0.0)
+        tr.scaleFactor.setValue(6, 0.1 , 6)
+        ground.addChild(tr)
+        mat = SoMaterial()
+        mat.diffuseColor = (0.0, 0.3, 0.0)  
+        ground.addChild(mat)    
+        ground.addChild(SoCube())
+        env.addChild(ground)
+
+        self.root = root
+
+        #CONTROLLER TIMER
+        self.controllerTimer=0
+
+class RawGLObject:
+    def __init__(self,u):
+        u.rawGLObjects.append(self)
+    def drawGL(self):   #called from special inventor GL callback
+        print 'abs error'
+
+
+def schedulingSensorCallback(u, scheduleSensor): #main step entry for sim
+    for physical in u.physicals:
+        physical.updateForces()
+
+    u.controllerTimer+=1
+    if u.controllerTimer==20:
+        u.controllerTimer=0
+        for robot in u.robots:
+            robot.controller.step()
+
+    #COLLISIONS
+
+    #this is equivilent to the collide2 on next line!
+    #u.space.collide((u.world, u.contactgroup), contact_callback) 
+    #ode.collide2(u.space, u.space,  (u.world, u.contactgroup), contact_callback)
+   
+    
+    for robot in u.robots:
+        ode.collide2(robot.geom, u.space, (u.world, u.contactgroup), oneway_contact_callback)
+        for seg in robot.segs:
+            ode.collide2(seg.geom, u.space, (u.world, u.contactgroup), oneway_contact_callback)
+    
+    #u.world.step(1.0/200.0)             #ODE step
+    u.world.step(1.0/100.0)             #ODE step
+    u.contactgroup.empty()
+    
+    for moving in u.movings:
+        moving.updateSceneGraph()
+
+def contact_callback(args, geom1, geom2): #GENERIC collision (like webots)
+    if geom1==geom2:
+        return
+    contacts = ode.collide(geom1, geom2)        # Check if the objects do collide
+    world,contactgroup = args         
+    for c in contacts:                            # Create contact joints
+        c.setBounce(0.2)
+        c.setMu(5000)
+        j = ode.ContactJoint(world, contactgroup, c)
+        j.attach(geom1.getBody(), geom2.getBody())
+
+def oneway_contact_callback(args, geom1, geom2): #ignore opposite force on environment
+    if geom1==geom2:
+        return
+    contacts = ode.collide(geom1, geom2)        # Check if the objects do collide
+    world,contactgroup = args         
+    for c in contacts:                            # Create contact joints
+        c.setBounce(0.2)
+        c.setMu(5000)
+        j = ode.ContactJoint(world, contactgroup, c)
+        j.attach(None, geom2.getBody())  #None=link to environment instead of other body (see ODE FAQ)
+
+#TODO an extra thing would be to remove the joint at the follicle, and replace by joining the whisker to the environment
+
+class Physical: 
+    def __init__(self,u):
+
+        self.ID = 'unnamed'
+        self.u=u  #pointer to universe (eg for collisions)        
+        u.physicals.append(self)
+        
+        self._mySoTransform=SoTransform()  #internals *ers
+        self._mySoRotation=SoRotation()
+        
+        self.body = [] #the subclass is responsible for making these
+        self.geom = []
+
+        sg = SoSeparator()
+        tr = self._mySoTransform
+        tr.translation = (0, 0, 0) #NB these get overwritten by update fns
+        tr.scaleFactor = (1, 1, 1)
+        sg.addChild(tr)
+        rot=self._mySoRotation
+        th = SbRotation(SbVec3f(0,1,0), 0)
+        rot.rotation.setValue(th)
+        sg.addChild(rot)
+        self.sg=sg
+        u.root.addChild(self.sg)
+        
+    def getSceneGraph(self):
+        return self.sg
+
+    def updateForces(self):
+        foo=0
+
+    def updateSceneGraph(self): #to be consistent with my ODE position
+        #print self.ID
+        x,y,z=self.body.getPosition()
+        self._mySoTransform.translation = (x, y, z)
+
+        th_ode = self.body.getRotation()   #is a rotation matrix (like in QC unitaries)
+        x_to = SbVec3f(1,0,0)
+        x_from = SbVec3f(th_ode[0:3])    #TODO check this is right way round??
+        th_inventor = SbRotation(x_from, x_to)   #there are many ways to set this -- eg using 4*4 matrix; axis-angle; from-to vecs.
+        
+        self._mySoRotation.rotation.setValue(th_inventor)   
+
+class Movable(Physical):  #adds to cache - for inventor graph recomputes
+    def __init__(self,u):
+        Physical.__init__(self,u)
+        u.movings.append(self)
+        
+class Sensor:
+    def read(self):
+        print("abs error")
+
+class DistanceSensor(Sensor):
+    def read(self):
+        foo=6 #TODO -- get world loc and angle, then call to each phys obj and return shortest dist
+
+class Robot(Movable):
+    def __init__(self,u,x,z):
+
+        Movable.__init__(self,u)  #inits ode, inventor etc and register with world
+
+        mass = ode.Mass()
+        mass.setSphere(2000, 0.5)                
+        self.body = ode.Body(self.u.world)
+        self.body.setMass(mass)
+        self.body.setPosition((x,1.5,z))
+
+        self.geom = ode.GeomSphere(u.robotSpace, 0.45)  #TODO do this properly
+        self.geom.setBody(self.body)
+
+#        self.sg.addChild(makeRobotSceneGraph())
+        self.sg.addChild(makeRatSceneGraph())
+
+
+#        self.controller = SimpleController(self)
+        self.controller = IceaController(self)
+
+        self.F_controller=(0.0, 0.0, 0.0)  #Force due to controller. cache these so we dont have to run controller on every physics step
+        self.T_controller=(0.0, 0.0, 0.0)  #Torque due to controller.
+        self.controller_bSetoff=False
+
+        u.robots.append(self)
+        self.sensors=[] #append sensors to this list!
+
+        self.segs=[]
+        self.follicleL = Follicle(u,self,z_offset=SEG_LENGTH)
+        self.follicleR = Follicle(u,self,z_offset=-SEG_LENGTH)
+        self.segs.append(self.follicleL)
+        self.segs.append(self.follicleR)
+
+        par=self.follicleL
+        for i in range(1,3):
+            seg = Segment(u,par,z_offset=SEG_LENGTH)
+            self.segs.append(seg)
+            par=seg
+        par=self.follicleR
+        for i in range(1,3):
+            seg = Segment(u,par,z_offset=-SEG_LENGTH)
+            self.segs.append(seg)
+            par=seg
+
+
+    def getBodyPositionForChildSeg(self):
+        x,y,z = self.body.getPosition()
+        z+=0.0
+        x+=0.0
+        return (x,y,z)
+    
+
+    def updateForces(self):        
+        v = self.body.getLinearVel()
+        gamma = 100000 #1000
+        F_damping = map(lambda x: -1*gamma*x, v)   #linear friction
+        self.body.addForce(F_damping)
+        
+        dth = self.body.getAngularVel()
+        gamma_th = 500
+        T_gamma = map(lambda x: -1*gamma_th*x, dth)   #rotational friction
+        self.body.addTorque(T_gamma) 
+
+        #print self.F_controller
+
+        self.body.addForce(self.F_controller)
+        self.body.addTorque(self.T_controller)
+        
+    def isCloseTo(self,tx,tz): #true if approximately at the target (tx,tz) location
+        mx,my,mz = self.body.getPosition()
+        thresh=0.3
+        return ((abs(tx-mx)<thresh) and (abs(tz-mz)<thresh))
+
+    def getTheta(self):  #gets my 2D angle in the floor plane, measured from the x axis
+        matrix = self.body.getRotation()   #as 3*3 rotation matrix
+        ky=-math.atan2(matrix[2],matrix[0])      
+        return ky
+            
+    def isFacing(self,th):  #test if approx facing theta in world coords
+        mth=self.getTheta()
+        thresh=0.1
+        #print mth, th
+        return (abs(fixAngle(th-mth))<thresh)
+
+    def applyControllerForceForward(self, f):   #f is the force magnitude
+        th=self.getTheta()
+        F=(f*math.cos(th), 0, f*math.sin(th))
+        self.F_controller = F
+
+    def moveDirectTo(self,x,z):
+        self.T_controller = (0.0,0.0,0.0)  #reset total force and torque
+        self.F_controller = (0.0,0.0,0.0)
+        
+        mx,my,mz=self.body.getPosition()
+        if self.isCloseTo(x,z):
+            print "at goal"
+            self.controller_bSetoff=False
+            return
+        Dx = x-mx
+        Dz = z-mz
+        r = math.sqrt(Dx**2 + Dz**2)
+        th_target = math.atan2(Dz,Dx)  #the way we want to be pointing TODO use atan2?
+        
+        if self.isFacing(th_target):
+            self.controller_bSetoff = True
+        
+        th=self.getTheta()
+        dth = fixAngle(th_target-th)
+        c=200
+        T = (0,-c*dth ,0)
+        self.T_controller = T
+
+        if self.controller_bSetoff:
+            self.applyControllerForceForward(100000)
+
+
+
+
+class Segment(Movable, RawGLObject): 
+    def __init__(self, u, par, z_offset):       
+        Movable.__init__(self,u)
+        RawGLObject.__init__(self,u)
+        #NB segment is a sphere mass -- so does not need to rotate!
+        #the bending is done by joints BETWEEN the masses        
+        mass = ode.Mass()
+        r=0.05
+        mass.setSphere(1000, r)                
+        self.body = ode.Body(self.u.world)
+        self.body.setMass(mass)
+        x,y,z=par.getBodyPositionForChildSeg()
+        x=x+SEG_LENGTH        #TODO fix properly
+        z=z+z_offset
+        self.body.setPosition((x,y,z))
+        self.geom = ode.GeomSphere(u.segSpace, r)  #SEPARATE SPACE!
+        self.geom.setBody(self.body)
+        self.sg.addChild(self.makeSceneGraph(r))
+        self.joint = ode.HingeJoint(self.u.world)  #easier to use horiz/vertical pairs of hinges rather than balls; as have getAngle methods
+        self.joint.attach(par.body, self.body)
+        self.joint.setAnchor(par.body.getPosition())
+        self.joint.setAxis((0,1,0))
+        self.k = 2 #rotational spring constant   (realistic: k=10, gam=2.  Needs 1/100s dt, very slow to simulate!)
+        self.gamma = 1 #2 #0.2    
+        self.par=par #needed for link graphics        
+            
+    def makeSceneGraph(self, r):  #return an Inventor tree ready to draw
+        r=r*0.5
+        sg=SoSeparator()
+        tr = SoTransform()
+        tr.scaleFactor = (r, r, r)
+        sg.addChild(tr)
+        myMaterial = SoMaterial()
+        myMaterial.diffuseColor = (0.5, 0.5, 1.0)  
+        sg.addChild(myMaterial)
+        sg.addChild(SoSphere())
+        return sg
+
+    def updateForces(self):
+        th = self.joint.getAngle()
+        T_k = -self.k*th            #spring torque
+        self.joint.addTorque(T_k)
+
+        dth = self.joint.getAngleRate()
+        T_gamma = -self.gamma*dth
+        self.joint.addTorque(T_gamma) #damping
+
+        #print 'th %f dth %f T_k %f T_gamma %f' % (th,dth,T_k,T_gamma)
+
+    def getBodyPositionForChildSeg(self):
+        return self.body.getPosition()
+
+    def drawGL(self):  #called by GL render callback fn from Inventor
+        glPushMatrix()
+
+        glTranslatef(0.0, 0.0, 0.0)
+        glColor3f(0.0, 0.7, 0.0)
+        glLineWidth(2)
+        glDisable(GL_LIGHTING)  # so we don't have to set normals  
+
+        glBegin(GL_LINES)
+        glVertex3fv(self.body.getPosition())
+        glVertex3fv(self.par.getBodyPositionForChildSeg())
+        glEnd()
+    
+        glEnable(GL_LIGHTING)   
+        glLineWidth(1)
+        glPopMatrix()
+
+class Follicle(Segment):
+    def __init__(self,u,par,z_offset):
+        Segment.__init__(self,u,par,z_offset)
+
+       
+
+
+
+class Block(Movable):  #an immobile block in the world, for collisions, a wall.
+    def __init__(self, u, x, y, z, lx, ly, lz):  #the center, and lengths
+        Movable.__init__(self,u)  #NB CHANGE THIS BACK TO PHYSICAL AS WELL AS CLASS!
+        
+        mass = ode.Mass()
+        mass.setSphere(500, 1)                
+        self.body = ode.Body(self.u.world)
+        self.body.setMass(mass)
+        self.body.setPosition((x,y,z)) 
+        self.sg.addChild(self.makeSceneGraph(lx, ly, lz))
+
+        self.geom = ode.GeomBox(u.space, lengths=(2*lx,2*ly,2*lz))
+        self.geom.setBody(self.body)
+            
+    def makeSceneGraph(self, lx, ly, lz):  #return an Inventor tree ready to draw
+        block=SoSeparator()
+        tr = SoTransform()
+        tr.scaleFactor = (lx, ly, lz)
+        block.addChild(tr)
+        myMaterial = SoMaterial()
+        myMaterial.diffuseColor = (1.0, 0.0, 0.0)  
+        block.addChild(myMaterial)
+        block.addChild(SoCube())
+        return block
+
+
+
+
+    
+# Callback routine to render the floor using OpenGL
+def myCallbackRoutine(void, action):
+    if not action.isOfType(SoGLRenderAction.getClassTypeId()): return        # only render the floor during GLRender actions
+    SoCacheElement.invalidate(action.getState()) #important--as the geometry is changing!
+
+    global u
+    for rawGLObject in u.rawGLObjects:
+        rawGLObject.drawGL()
+
+
+  
+def main():
+    myWindow = SoGui.init(sys.argv[0])
+    if myWindow == None: sys.exit(1)
+
+    global u
+    u=Universe() #is global, so callbacks can see it!
+
+    h=0.8
+
+
+    if 0:  #arena
+        wall1 = Block(u, 0,1,5, 5,1,0.1)
+        wall2 = Block(u, 0,1,-5, 5,1,0.1)
+        wall3 = Block(u, 5,1,0, .1,1,5)
+        wall4 = Block(u, -5,1,0, .1,1,5)
+    else:    #plus-maze
+        wallN = Block(u, 0,h,-5,   1,h,0.1)
+        wallE = Block(u, 5,h,0,    0.1,h,1)
+        wallS = Block(u, 0,h,5,    1,h,0.1)
+        #wallW = Block(u, -5,h,0,   0.1,h,1)
+        wallNw = Block(u, -1,h,-3,   0.1,h,2)
+        wallNe = Block(u,  1,h,-3,   0.1,h,2)
+        wallSw = Block(u, -1,h, 3,   0.1,h,2)
+        wallSe = Block(u,  1,h, 3,   0.1,h,2)        
+        wallWn = Block(u, -3,h,-1,   2,h,0.1)
+        wallWs = Block(u, -3,h, 1,   2,h,0.1)
+        wallEn = Block(u,  3,h,-1,   2,h,0.1)
+        wallEs = Block(u,  3,h, 1,   2,h,0.1)
+
+
+
+    robot = Robot(u, -6.0, 0.0)  #x,z
+    #robot.body.addTorque((0,-100000,0))
+   
+    #TIMER   
+    schedulingSensor = SoTimerSensor(schedulingSensorCallback, u)
+    schedulingSensor.setInterval(0.01) # once per 1 seconds   0.001 is good
+    schedulingSensor.schedule()
+
+    #GL CALLBACK
+    myCallback = SoCallback()
+    myCallback.setCallback(myCallbackRoutine)
+    u.root.addChild(myCallback)
+
+
+    # Create a renderArea in which to see the scene
+    #myRenderArea = SoGuiRenderArea(myWindow)
+    myRenderArea = SoGuiExaminerViewer(myWindow)
+    u.myCamera.viewAll(u.root, myRenderArea.getViewportRegion())      # Make myCamera see everything.
+    myRenderArea.setSceneGraph(u.root)       # Put our scene in myRenderArea, change the title
+    myRenderArea.setTitle("ICEASim - Freebots")
+    myRenderArea.show()
+    SoGui.show(myWindow)  # Display main window
+    SoGui.mainLoop()    # Main Inventor event loop
+
+if __name__ == "__main__":
+    main()
+
+
+
+
