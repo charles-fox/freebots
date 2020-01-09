@@ -1,2 +1,2 @@
 # freebots
-3D robotics simulation (similar to Webots)
+3D robotics simulation 
